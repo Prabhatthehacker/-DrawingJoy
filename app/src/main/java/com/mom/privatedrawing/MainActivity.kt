@@ -1,760 +1,710 @@
 package com.mom.privatedrawing
 
+import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.drawable.GradientDrawable
-
-import android.net.Uri
-import android.os.Bundle
-import android.view.LayoutInflater
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.RectF
+import android.util.AttributeSet
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
-import android.widget.EditText
-import android.widget.GridLayout
-import android.widget.ImageView
-import android.widget.LinearLayout
-import android.widget.ListView
-import android.widget.SeekBar
-import android.widget.TextView
-import android.widget.Toast
-import androidx.activity.addCallback
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import java.io.File
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
 
-class MainActivity : AppCompatActivity() {
+class DrawingView @JvmOverloads constructor(
+    context: Context,
+    attrs: AttributeSet? = null
+) : View(context, attrs) {
 
-    private lateinit var drawingView: DrawingView
-    private lateinit var leftPanel: View
-    private lateinit var toolStrip: View
-    private lateinit var topActions: View
-    private lateinit var colorGrid: GridLayout
-    private lateinit var brushSizeSlider: SeekBar
-    private lateinit var colorsPanelContent: View
-    private lateinit var textOptionsPanel: View
-    private lateinit var textColorGrid: GridLayout
-    private lateinit var textSizeSlider: SeekBar
+    var currentTool: Tool = Tool.PEN
+    var currentColor: Int = Color.BLACK
+    var currentStrokeWidth: Float = 12f
+    var onHistoryChanged: (() -> Unit)? = null
+    var onSelectionReady: ((RectF) -> Unit)? = null
 
+    private val actions = mutableListOf<DrawAction>()
+    private val redoStack = mutableListOf<DrawAction>()
+    private var baseBitmap: Bitmap? = null
+    private var baseCanvas: Canvas? = null
 
-    private var deviceType: DeviceType = DeviceType.TABLET
-    private var selectedTextColor: Int = Color.BLACK
+    private fun Paint.applyStrokeStyle() {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeJoin = Paint.Join.ROUND
+        strokeCap = Paint.Cap.ROUND
+    }
 
-    private var customColors = mutableListOf<Int>()
-    private var selectedSwatch: View? = null
+    private var activePath: Path? = null
+    private val activePaint = Paint().apply { applyStrokeStyle() }
 
-    private var isFullscreen = false
+    private var shapeStartX = 0f
+    private var shapeStartY = 0f
+    private var shapeCurX = 0f
+    private var shapeCurY = 0f
+    private var isShaping = false
+    var shapesFilled: Boolean = false
 
-    // 21 colors laid out 3 per row, matching the reference design: the left column is the
-    // rainbow (red -> purple), the middle column is a lighter tint of each, the right column
-    // is a darker shade, and the last row is the neutrals.
-    private val defaultPalette = listOf(
-        Color.parseColor("#E5252A"), Color.parseColor("#F4787E"), Color.parseColor("#8B0A24"), // reds
-        Color.parseColor("#FB8C00"), Color.parseColor("#FFA562"), Color.parseColor("#9A5A0C"), // oranges / brown
-        Color.parseColor("#FDD800"), Color.parseColor("#F5E465"), Color.parseColor("#C1A100"), // yellows
-        Color.parseColor("#2FA84F"), Color.parseColor("#6DC46F"), Color.parseColor("#1B6B30"), // greens
-        Color.parseColor("#2E8FE0"), Color.parseColor("#6FB1E8"), Color.parseColor("#1A5290"), // blues
-        Color.parseColor("#7A2FBF"), Color.parseColor("#A768D8"), Color.parseColor("#5B1A8C"), // purples
-        Color.parseColor("#7F7F7F"), Color.WHITE, Color.BLACK                                  // gray, white, black
-    )
-    private val neutralLabels = mapOf(18 to "Gray", 19 to "White", 20 to "Black")
+    private var selectionStartX = 0f
+    private var selectionStartY = 0f
+    private var selectionRect: RectF? = null
+    private var copiedSelection: Bitmap? = null
 
-    // On a phone there isn't room for all 21, so it shows 12 of the most useful ones
-    // (still big) and puts the rest behind "See all colors".
-    private val phoneQuickIndices = listOf(0, 3, 6, 9, 12, 15, 5, 1, 13, 18, 19, 20)
+    var onCanvasTapForText: ((x: Float, y: Float) -> Unit)? = null
 
-    private val imagePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-        uri?.let {
-            val bitmap = android.provider.MediaStore.Images.Media.getBitmap(contentResolver, it)
-            drawingView.addImage(bitmap)
+    private val clearXfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
+
+    private var cursorX = 0f
+    private var cursorY = 0f
+    private var isCursorVisible = false
+    private val cursorIconCache = mutableMapOf<Tool, Bitmap>()
+    private val cursorPaint = Paint().apply {
+        isAntiAlias = true
+        colorFilter = android.graphics.PorterDuffColorFilter(Color.DKGRAY, PorterDuff.Mode.SRC_IN)
+        alpha = 200
+    }
+    private val crosshairPaint = Paint().apply {
+        isAntiAlias = true
+        color = Color.DKGRAY
+        alpha = 200
+        strokeWidth = 2f
+        style = Paint.Style.STROKE
+    }
+
+    private fun cursorIconResFor(tool: Tool): Int? = when (tool) {
+        Tool.PEN -> R.drawable.ic_tool_pen
+        Tool.PENCIL -> R.drawable.ic_tool_pencil
+        Tool.MARKER -> R.drawable.ic_tool_marker
+        Tool.HIGHLIGHTER -> R.drawable.ic_tool_highlighter
+        Tool.BRUSH -> R.drawable.ic_tool_brush
+        Tool.ERASER -> R.drawable.ic_tool_eraser
+        else -> null
+    }
+
+    private fun cursorIconFor(tool: Tool): Bitmap? {
+        val resId = cursorIconResFor(tool) ?: return null
+        return cursorIconCache.getOrPut(tool) {
+            val sizePx = (26 * resources.displayMetrics.density).toInt().coerceAtLeast(1)
+            val drawable = androidx.core.content.ContextCompat.getDrawable(context, resId)!!.mutate()
+            val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+            drawable.setBounds(0, 0, sizePx, sizePx)
+            drawable.draw(Canvas(bmp))
+            bmp
         }
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+    private fun updateCursor(x: Float, y: Float, visible: Boolean) {
+        cursorX = x
+        cursorY = y
+        isCursorVisible = visible
+        invalidate()
+    }
 
-        drawingView = findViewById(R.id.drawingView)
-        leftPanel = findViewById(R.id.leftPanel)
-        toolStrip = findViewById(R.id.toolStrip)
-        topActions = findViewById(R.id.topActionsScroll)
-        colorGrid = findViewById(R.id.colorGrid)
-        brushSizeSlider = findViewById(R.id.brushSizeSlider)
-        colorsPanelContent = findViewById(R.id.colorsPanelContent)
-        textOptionsPanel = findViewById(R.id.textOptionsPanel)
-        textColorGrid = findViewById(R.id.textColorGrid)
-        textSizeSlider = findViewById(R.id.textSizeSlider)
-
-        customColors = ColorStore.loadCustomColors(this)
-
-        buildColorGrid()
-        findViewById<View>(R.id.btnCreateColor).setOnClickListener { openColorPicker() }
-        buildToolStrip()
-        wireBrushSizeControls()
-        wireTopActions()
-        setupTextOptionsPanel()
-
-        drawingView.onHistoryChanged = { refreshUndoRedoState() }
-        drawingView.onCanvasTapForText = { x, y -> showTextInputDialog(x, y) }
-
-        val saved = DevicePrefs.getSavedDeviceType(this)
-        if (saved == null) {
-            showDeviceTypePicker(isFirstLaunch = true)
+    private fun drawCursorOverlay(canvas: Canvas) {
+        if (!isCursorVisible) return
+        val isShapeTool = currentTool in setOf(Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.TRIANGLE, Tool.STAR)
+        if (isShapeTool) {
+            val armLength = 16f * resources.displayMetrics.density
+            canvas.drawLine(cursorX - armLength, cursorY, cursorX + armLength, cursorY, crosshairPaint)
+            canvas.drawLine(cursorX, cursorY - armLength, cursorX, cursorY + armLength, crosshairPaint)
+            canvas.drawCircle(cursorX, cursorY, 3f * resources.displayMetrics.density, crosshairPaint)
         } else {
-            deviceType = saved
-            applyDeviceSizing()
+            val bitmap = cursorIconFor(currentTool) ?: return
+            canvas.drawBitmap(bitmap, cursorX, cursorY - bitmap.height, cursorPaint)
         }
+    }
 
-        // Warn before leaving with unsaved work, instead of silently losing it.
-        onBackPressedDispatcher.addCallback(this) {
-            if (drawingView.canUndo()) {
-                AlertDialog.Builder(this@MainActivity)
-                    .setTitle("Unsaved changes")
-                    .setMessage("This drawing hasn't been saved yet. What would you like to do?")
-                    .setNegativeButton("Discard") { _, _ -> finish() }
-                    .setNeutralButton("Cancel", null)
-                    .setPositiveButton("Save") { _, _ -> saveDrawing(onSaved = { finish() }) }
-                    .show()
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (w > 0 && h > 0) {
+            val newBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val newCanvas = Canvas(newBitmap)
+            baseBitmap?.let { old ->
+                newCanvas.drawBitmap(old, 0f, 0f, null)
+            }
+            baseBitmap = newBitmap
+            baseCanvas = newCanvas
+            redrawAllActions()
+        }
+    }
+
+    private var scaleFactor = 1f
+    private var panX = 0f
+    private var panY = 0f
+    private val minScale = 1f
+    private val maxScale = 5f
+    private var isMultiTouch = false
+    private var lastFocusX = 0f
+    private var lastFocusY = 0f
+
+    private val scaleGestureDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            val prevScale = scaleFactor
+            scaleFactor = (scaleFactor * detector.scaleFactor).coerceIn(minScale, maxScale)
+            val change = scaleFactor / prevScale
+            panX = detector.focusX - (detector.focusX - panX) * change
+            panY = detector.focusY - (detector.focusY - panY) * change
+            invalidate()
+            return true
+        }
+    })
+
+    fun isZoomedOrPanned(): Boolean = scaleFactor != 1f || panX != 0f || panY != 0f
+
+    fun resetZoom() {
+        scaleFactor = 1f
+        panX = 0f
+        panY = 0f
+        invalidate()
+    }
+
+    private fun averageX(event: MotionEvent): Float {
+        var sum = 0f
+        for (i in 0 until event.pointerCount) sum += event.getX(i)
+        return sum / event.pointerCount
+    }
+
+    private fun averageY(event: MotionEvent): Float {
+        var sum = 0f
+        for (i in 0 until event.pointerCount) sum += event.getY(i)
+        return sum / event.pointerCount
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        scaleGestureDetector.onTouchEvent(event)
+
+        if (event.pointerCount >= 2) {
+            if (!isMultiTouch) {
+                activePath = null
+                isShaping = false
+                selectionRect = null
+                updateCursor(0f, 0f, visible = false)
+                isMultiTouch = true
+                lastFocusX = averageX(event)
+                lastFocusY = averageY(event)
+            } else if (!scaleGestureDetector.isInProgress) {
+                val fx = averageX(event)
+                val fy = averageY(event)
+                panX += fx - lastFocusX
+                panY += fy - lastFocusY
+                lastFocusX = fx
+                lastFocusY = fy
+                invalidate()
             } else {
-                finish()
+                lastFocusX = averageX(event)
+                lastFocusY = averageY(event)
             }
-        }
-    }
-
-    // ---------------- Device type (phone / tablet) ----------------
-
-    private fun showDeviceTypePicker(isFirstLaunch: Boolean) {
-        val view = LayoutInflater.from(this).inflate(R.layout.dialog_device_type, null)
-        val builder = AlertDialog.Builder(this).setView(view).setCancelable(!isFirstLaunch)
-        val dialog = builder.create()
-
-        view.findViewById<View>(R.id.optionPhone).setOnClickListener {
-            deviceType = DeviceType.PHONE
-            DevicePrefs.saveDeviceType(this, deviceType)
-            applyDeviceSizing()
-            dialog.dismiss()
-        }
-        view.findViewById<View>(R.id.optionTablet).setOnClickListener {
-            deviceType = DeviceType.TABLET
-            DevicePrefs.saveDeviceType(this, deviceType)
-            applyDeviceSizing()
-            dialog.dismiss()
-        }
-        dialog.show()
-    }
-
-    private fun applyDeviceSizing() {
-        val density = resources.displayMetrics.density
-        val isPhone = deviceType == DeviceType.PHONE
-
-        // Left color panel width
-        val panelWidthDp = if (isPhone) 164f else 188f
-        leftPanel.layoutParams = leftPanel.layoutParams.apply {
-            width = (panelWidthDp * density).toInt()
+            return true
         }
 
-        // Bottom tool strip buttons
-        val toolButtonWidthDp = if (isPhone) 52f else 64f
-        val labelSize = if (isPhone) 9.5f else 10.5f
-        for (btn in toolButtons.values) {
-            btn.layoutParams = LinearLayout.LayoutParams(
-                (toolButtonWidthDp * density).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-            (btn.getChildAt(1) as? TextView)?.textSize = labelSize
+        if (isMultiTouch) {
+            isMultiTouch = false
+            return true
         }
 
-        // Top action pills (Record / More / Save / Share) — tighter on phones
-        val pillHPaddingPx = ((if (isPhone) 10f else 14f) * density).toInt()
-        val pillVPaddingPx = ((if (isPhone) 6f else 8f) * density).toInt()
-        val pillTextSize = if (isPhone) 12f else 13f
-        for (id in intArrayOf(R.id.btnMore, R.id.btnSave, R.id.btnShare)) {
-            findViewById<TextView>(id)?.apply {
-                setPadding(pillHPaddingPx, pillVPaddingPx, pillHPaddingPx, pillVPaddingPx)
-                textSize = pillTextSize
-            }
-        }
+        val x = (event.x - panX) / scaleFactor
+        val y = (event.y - panY) / scaleFactor
 
-        // Color swatches — rebuild so the new size in swatchLayoutParams() takes effect
-        buildColorGrid()
-        setupTextOptionsPanel()
-
-        leftPanel.requestLayout()
-    }
-
-    // ---------------- Colors ----------------
-
-    private fun buildColorGrid() {
-        colorGrid.columnCount = 3
-        colorGrid.removeAllViews()
-        val isPhone = deviceType == DeviceType.PHONE
-        val indices = if (isPhone) phoneQuickIndices else defaultPalette.indices.toList()
-        for (i in indices) {
-            val color = defaultPalette[i]
-            val label = if (isPhone) null else neutralLabels[i]
-            if (label != null) {
-                colorGrid.addView(makeLabeledSwatch(color, label) { selectColor(color, it) })
-            } else {
-                colorGrid.addView(makeSwatch(color) { selectColor(color, it) })
-            }
-        }
-
-        if (isPhone) {
-            val seeAll = TextView(this).apply {
-                text = "See all colors \u2192"
-                textSize = 12.5f
-                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.accent))
-                setPadding(4, 10, 4, 4)
-                setOnClickListener { showAllColorsDialog() }
-            }
-            val seeAllParams = GridLayout.LayoutParams()
-            seeAllParams.columnSpec = GridLayout.spec(0, 3)
-            seeAll.layoutParams = seeAllParams
-            colorGrid.addView(seeAll)
-        }
-
-        // Custom ("My Colors") colors live in this same box and the same grid — no
-        // separate section, just more circles. The "create your own color" button is
-        // NOT in here — it's a separate button outside this box (wired in onCreate).
-        for (color in customColors) {
-            colorGrid.addView(makeSwatch(color) { selectColor(color, it) })
-        }
-    }
-
-    /** Every color, in the same 3-column layout as the panel (used by "See all colors" on phone). */
-    private fun showAllColorsDialog() {
-        val grid = GridLayout(this).apply {
-            columnCount = 3
-            useDefaultMargins = false
-        }
-
-        lateinit var dialog: AlertDialog
-
-        for (i in defaultPalette.indices) {
-            val color = defaultPalette[i]
-            val label = neutralLabels[i]
-            val onPick: (View) -> Unit = { view ->
-                selectColor(color, view)
-                dialog.dismiss()
-            }
-            grid.addView(if (label != null) makeLabeledSwatch(color, label, onPick) else makeSwatch(color, onPick))
-        }
-
-        val scroll = android.widget.ScrollView(this).apply {
-            setPadding(24, 16, 24, 0)
-            addView(grid)
-        }
-
-        dialog = AlertDialog.Builder(this)
-            .setTitle("All Colors")
-            .setView(scroll)
-            .setNegativeButton("Close", null)
-            .create()
-        dialog.show()
-    }
-
-    private fun swatchSizeDp(): Float = if (deviceType == DeviceType.PHONE) 38f else 44f
-    private fun swatchMarginDp(): Float = if (deviceType == DeviceType.PHONE) 3f else 4f
-
-    private fun swatchLayoutParams(): GridLayout.LayoutParams {
-        val density = resources.displayMetrics.density
-        val sizePx = (swatchSizeDp() * density).toInt()
-        val marginPx = (swatchMarginDp() * density).toInt()
-        val params = GridLayout.LayoutParams()
-        params.width = sizePx
-        params.height = sizePx
-        params.setMargins(marginPx, marginPx, marginPx, marginPx)
-        return params
-    }
-
-    private fun swatchDrawable(color: Int): GradientDrawable = GradientDrawable().apply {
-        shape = GradientDrawable.OVAL
-        setColor(color)
-        setStroke(2, Color.parseColor("#DADDE5"))
-    }
-
-    private fun makeSwatch(color: Int, onClick: (View) -> Unit): View {
-        val swatch = View(this)
-        swatch.layoutParams = swatchLayoutParams()
-        swatch.background = swatchDrawable(color)
-        swatch.setOnClickListener { onClick(swatch) }
-        return swatch
-    }
-
-    /** A swatch with a small caption underneath it (used for Gray / White / Black). */
-    private fun makeLabeledSwatch(color: Int, label: String, onClick: (View) -> Unit): View {
-        val density = resources.displayMetrics.density
-        val sizePx = (swatchSizeDp() * density).toInt()
-        val marginPx = (swatchMarginDp() * density).toInt()
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = android.view.Gravity.CENTER_HORIZONTAL
-            layoutParams = GridLayout.LayoutParams().apply {
-                width = sizePx
-                height = android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-                setMargins(marginPx, marginPx, marginPx, marginPx)
-            }
-        }
-        val swatch = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(sizePx, sizePx)
-            background = swatchDrawable(color)
-        }
-        val caption = TextView(this).apply {
-            text = label
-            textSize = 11f
-            gravity = android.view.Gravity.CENTER
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
-            setPadding(0, 4, 0, 0)
-        }
-        container.addView(swatch)
-        container.addView(caption)
-        container.setOnClickListener { onClick(container) }
-        return container
-    }
-
-    private fun selectColor(color: Int, view: View) {
-        drawingView.currentColor = color
-        selectedSwatch = view
-        highlightSelected(view)
-    }
-
-    private fun highlightSelected(view: View) {
-        for (grid in listOf(colorGrid, textColorGrid)) {
-            for (i in 0 until grid.childCount) {
-                grid.getChildAt(i).scaleX = 1f
-                grid.getChildAt(i).scaleY = 1f
-            }
-        }
-        view.scaleX = 1.15f
-        view.scaleY = 1.15f
-    }
-
-    private fun openColorPicker() {
-        ColorPickerDialog.show(
-            this,
-            drawingView.currentColor,
-            onUseColor = { color -> drawingView.currentColor = color },
-            onAddToMyColors = { color ->
-                customColors.add(0, color)
-                if (customColors.size > 12) customColors = customColors.take(12).toMutableList()
-                ColorStore.saveCustomColors(this, customColors)
-                buildColorGrid()
-                drawingView.currentColor = color
-            }
-        )
-    }
-
-    // ---------------- Tools ----------------
-
-    private data class ToolEntry(val tool: Tool, val label: String, val iconRes: Int)
-
-    private val toolEntries = listOf(
-        ToolEntry(Tool.PEN, "Pen", R.drawable.ic_tool_pen),
-        ToolEntry(Tool.PENCIL, "Pencil", R.drawable.ic_tool_pencil),
-        ToolEntry(Tool.MARKER, "Marker", R.drawable.ic_tool_marker),
-        ToolEntry(Tool.HIGHLIGHTER, "Highlighter", R.drawable.ic_tool_highlighter),
-        ToolEntry(Tool.BRUSH, "Brush", R.drawable.ic_tool_brush),
-        ToolEntry(Tool.ERASER, "Eraser", R.drawable.ic_tool_eraser),
-        ToolEntry(Tool.FILL, "Fill", R.drawable.ic_tool_fill),
-        ToolEntry(Tool.TEXT, "Text", R.drawable.ic_tool_text),
-        ToolEntry(Tool.LINE, "Line", R.drawable.ic_tool_line),
-        ToolEntry(Tool.RECTANGLE, "Rectangle", R.drawable.ic_tool_rectangle),
-        ToolEntry(Tool.CIRCLE, "Circle", R.drawable.ic_tool_circle),
-        ToolEntry(Tool.TRIANGLE, "Triangle", R.drawable.ic_tool_triangle),
-        ToolEntry(Tool.STAR, "Star", R.drawable.ic_tool_star),
-        ToolEntry(Tool.IMAGE, "Image", R.drawable.ic_tool_image)
-    )
-
-    private val toolButtons = mutableMapOf<Tool, LinearLayout>()
-    private val toolIcons = mutableMapOf<Tool, ImageView>()
-    private lateinit var undoButton: LinearLayout
-    private lateinit var redoButton: LinearLayout
-
-    private fun makeToolButton(iconRes: Int, label: String, tint: Int? = null): Pair<LinearLayout, ImageView> {
-        val density = resources.displayMetrics.density
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = android.view.Gravity.CENTER
-            val widthDp = if (deviceType == DeviceType.PHONE) 52f else 64f
-            layoutParams = LinearLayout.LayoutParams(
-                (widthDp * density).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-            setPadding(4, 8, 4, 8)
-            isClickable = true
-            isFocusable = true
-        }
-        val icon = ImageView(this).apply {
-            setImageResource(iconRes)
-            layoutParams = LinearLayout.LayoutParams((24 * density).toInt(), (24 * density).toInt())
-            tint?.let { setColorFilter(it) }
-        }
-        val text = TextView(this).apply {
-            this.text = label
-            textSize = if (deviceType == DeviceType.PHONE) 9.5f else 10.5f
-            gravity = android.view.Gravity.CENTER
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
-            setPadding(0, 4, 0, 0)
-        }
-        container.addView(icon)
-        container.addView(text)
-        return container to icon
-    }
-
-    private fun makeToolDivider(): View {
-        val density = resources.displayMetrics.density
-        return View(this).apply {
-            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.divider))
-            layoutParams = LinearLayout.LayoutParams((1 * density).toInt().coerceAtLeast(1), (40 * density).toInt()).apply {
-                gravity = android.view.Gravity.CENTER_VERTICAL
-                setMargins((8 * density).toInt(), 0, (8 * density).toInt(), 0)
-            }
-        }
-    }
-
-    private fun buildToolStrip() {
-        val container = findViewById<LinearLayout>(R.id.toolStripInner)
-        container.removeAllViews()
-        toolButtons.clear()
-        toolIcons.clear()
-
-        for (entry in toolEntries) {
-            val (btn, icon) = makeToolButton(entry.iconRes, entry.label)
-            btn.setOnClickListener {
-                if (entry.tool == Tool.IMAGE) {
-                    imagePicker.launch("image/*")
-                } else {
-                    selectTool(entry.tool)
+        when (currentTool) {
+            Tool.PEN, Tool.PENCIL, Tool.MARKER, Tool.HIGHLIGHTER, Tool.BRUSH, Tool.ERASER -> handleFreehand(event, x, y)
+            Tool.LINE -> handleShape(event, x, y, ShapeType.LINE)
+            Tool.RECTANGLE -> handleShape(event, x, y, ShapeType.RECTANGLE)
+            Tool.CIRCLE -> handleShape(event, x, y, ShapeType.CIRCLE)
+            Tool.TRIANGLE -> handleShape(event, x, y, ShapeType.TRIANGLE)
+            Tool.STAR -> handleShape(event, x, y, ShapeType.STAR)
+            Tool.FILL -> {
+                if (event.action == MotionEvent.ACTION_DOWN) {
+                    floodFill(x.toInt(), y.toInt(), currentColor)
                 }
             }
-            toolButtons[entry.tool] = btn
-            toolIcons[entry.tool] = icon
-            container.addView(btn)
-            if (entry.tool == Tool.FILL) container.addView(makeToolDivider())
-        }
-
-        val (undo, undoIcon) = makeToolButton(R.drawable.ic_tool_undo, "Undo")
-        undo.setOnClickListener { drawingView.undo() }
-        undoButton = undo
-
-        val (redo, redoIcon) = makeToolButton(R.drawable.ic_tool_redo, "Redo")
-        redo.setOnClickListener { drawingView.redo() }
-        redoButton = redo
-
-        val (clear, _) = makeToolButton(R.drawable.ic_tool_clear, "Clear")
-        (clear.getChildAt(1) as TextView).setTextColor(ContextCompat.getColor(this, R.color.record_red))
-        clear.setOnClickListener { confirmClear() }
-
-        container.addView(makeToolDivider())
-        container.addView(undo)
-        container.addView(redo)
-        container.addView(clear)
-
-        selectTool(Tool.PEN)
-        refreshUndoRedoState()
-    }
-
-    private fun selectTool(tool: Tool) {
-        drawingView.currentTool = tool
-        val selectedColor = ContextCompat.getColor(this, R.color.tool_selected_icon)
-        val normalColor = ContextCompat.getColor(this, R.color.text_primary)
-        for ((t, btn) in toolButtons) {
-            val isSelected = t == tool
-            btn.background = if (isSelected) ContextCompat.getDrawable(this, R.drawable.bg_tool_selected) else null
-            toolIcons[t]?.setColorFilter(if (isSelected) selectedColor else normalColor)
-        }
-        if (tool == Tool.TEXT) {
-            colorsPanelContent.visibility = View.GONE
-            textOptionsPanel.visibility = View.VISIBLE
-        } else {
-            colorsPanelContent.visibility = View.VISIBLE
-            textOptionsPanel.visibility = View.GONE
-        }
-    }
-
-    private fun setupTextOptionsPanel() {
-        textColorGrid.columnCount = 3
-        textColorGrid.removeAllViews()
-        for (color in defaultPalette) {
-            val swatch = makeSwatch(color) { view ->
-                selectedTextColor = color
-                highlightSelected(view)
-            }
-            textColorGrid.addView(swatch)
-        }
-
-        findViewById<TextView>(R.id.btnExitTextMode).setOnClickListener {
-            selectTool(Tool.PEN)
-        }
-    }
-
-    private fun refreshUndoRedoState() {
-        undoButton.alpha = if (drawingView.canUndo()) 1f else 0.4f
-        redoButton.alpha = if (drawingView.canRedo()) 1f else 0.4f
-    }
-
-    private fun confirmClear() {
-        AlertDialog.Builder(this)
-            .setTitle("Clear the entire drawing?")
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Clear") { _, _ -> drawingView.clearAll() }
-            .show()
-    }
-
-    // ---------------- Brush size ----------------
-
-    private fun wireBrushSizeControls() {
-        brushSizeSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                val density = resources.displayMetrics.density
-                drawingView.currentStrokeWidth = (2 + progress * 0.58f) * density
-            }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-        })
-        findViewById<View>(R.id.sizeXS).setOnClickListener { brushSizeSlider.progress = 3 }
-        findViewById<View>(R.id.sizeSmall).setOnClickListener { brushSizeSlider.progress = 10 }
-        findViewById<View>(R.id.sizeMedium).setOnClickListener { brushSizeSlider.progress = 30 }
-        findViewById<View>(R.id.sizeLarge).setOnClickListener { brushSizeSlider.progress = 55 }
-        findViewById<View>(R.id.sizeXL).setOnClickListener { brushSizeSlider.progress = 85 }
-    }
-
-    // ---------------- Text tool ----------------
-
-    private fun showTextInputDialog(x: Float, y: Float) {
-        val input = EditText(this)
-        input.hint = "Type your text"
-        AlertDialog.Builder(this)
-            .setTitle("Add Text")
-            .setView(input)
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Add") { _, _ ->
-                val text = input.text.toString()
-                if (text.isNotBlank()) {
-                    val textSize = 16f + (textSizeSlider.progress * 0.6f)
-                    drawingView.addText(text, x, y, selectedTextColor, textSize)
+            Tool.TEXT -> {
+                if (event.action == MotionEvent.ACTION_UP) {
+                    onCanvasTapForText?.invoke(x, y)
                 }
             }
-            .show()
+            Tool.SELECT -> handleSelection(event, x, y)
+            Tool.IMAGE -> { }
+        }
+        return true
     }
 
-    // ---------------- Top actions: fullscreen / save / share / record ----------------
-
-    private fun wireTopActions() {
-        findViewById<View>(R.id.btnMore).setOnClickListener { showMoreMenu(it) }
-        findViewById<View>(R.id.btnSave).setOnClickListener { saveDrawing() }
-        findViewById<View>(R.id.btnShare).setOnClickListener { shareDrawing() }
-
-        // Tapping the logo jumps straight to My Drawings; a long-press (or hover on a
-        // device with a mouse/stylus hovering) shows a small "My Drawings" label first,
-        // so it's discoverable without needing to tap the "More" menu.
-        findViewById<View>(R.id.appTitle).apply {
-            setOnClickListener { showMyDrawingsDialog() }
-            androidx.core.view.ViewCompat.setTooltipText(this, "My Drawings")
-        }
-    }
-
-    private fun showMoreMenu(anchor: View) {
-        val popup = android.widget.PopupMenu(this, anchor)
-        popup.menu.add("Full Screen")
-        popup.menu.add("My Drawings")
-        if (drawingView.isZoomedOrPanned()) {
-            popup.menu.add("Reset Zoom")
-        }
-        popup.setOnMenuItemClickListener { item ->
-            when (item.title) {
-                "Full Screen" -> toggleFullscreen()
-                "My Drawings" -> showMyDrawingsDialog()
-                "Reset Zoom" -> drawingView.resetZoom()
+    private fun handleSelection(event: MotionEvent, x: Float, y: Float) {
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                selectionStartX = x
+                selectionStartY = y
+                selectionRect = RectF(x, y, x, y)
+                invalidate()
             }
-            true
-        }
-        popup.show()
-    }
-
-    private fun toggleFullscreen() {
-        isFullscreen = !isFullscreen
-        leftPanel.visibility = if (isFullscreen) View.GONE else View.VISIBLE
-        toolStrip.visibility = if (isFullscreen) View.GONE else View.VISIBLE
-        findViewById<View>(R.id.appTitle).visibility = if (isFullscreen) View.GONE else View.VISIBLE
-    }
-
-    private fun saveDrawing(onSaved: (() -> Unit)? = null) {
-        val bitmap = drawingView.exportBitmap() ?: return
-
-        val input = EditText(this).apply {
-            setText(SavedDrawingsStore.suggestedName())
-            setSelection(text.length)
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Name this drawing")
-            .setView(input)
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Save") { _, _ ->
-                val name = input.text.toString().trim().ifBlank { SavedDrawingsStore.suggestedName() }
-                val uri = SaveUtil.savePngToGallery(this, bitmap)
-                SavedDrawingsStore.saveProject(this, bitmap, name)
-                if (uri != null) {
-                    Toast.makeText(this, "Drawing saved", Toast.LENGTH_SHORT).show()
-                    onSaved?.invoke()
-                } else {
-                    Toast.makeText(this, "Could not save the drawing.", Toast.LENGTH_SHORT).show()
-                }
-            }
-            .show()
-    }
-
-    private fun shareDrawing() {
-        val bitmap = drawingView.exportBitmap() ?: return
-        val uri = SaveUtil.saveTempPngForShare(this, bitmap)
-        SaveUtil.shareFile(this, uri, "image/png")
-    }
-
-    // ---------------- My Drawings (reopen a saved drawing and keep working) ----------------
-
-    private fun showMyDrawingsDialog() {
-        val allProjects = SavedDrawingsStore.listProjects(this)
-        if (allProjects.isEmpty()) {
-            Toast.makeText(this, "No saved drawings yet. Tap Save to create one.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val currentList = allProjects.toMutableList()
-
-        val dialogView = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(24, 8, 24, 0)
-        }
-        val searchBox = EditText(this).apply {
-            hint = "Search by name"
-        }
-        val listView = ListView(this)
-        dialogView.addView(searchBox)
-        dialogView.addView(listView)
-
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("My Drawings")
-            .setView(dialogView)
-            .setNegativeButton("Close", null)
-            .create()
-
-        val adapter = object : android.widget.BaseAdapter() {
-            override fun getCount() = currentList.size
-            override fun getItem(position: Int) = currentList[position]
-            override fun getItemId(position: Int) = position.toLong()
-            override fun getView(position: Int, convertView: View?, parent: android.view.ViewGroup?): View {
-                val view = convertView ?: LayoutInflater.from(this@MainActivity)
-                    .inflate(R.layout.item_saved_drawing, parent, false)
-                val file = currentList[position]
-                val thumb = view.findViewById<ImageView>(R.id.thumbnail)
-                val name = view.findViewById<TextView>(R.id.drawingName)
-                val delete = view.findViewById<TextView>(R.id.deleteDrawing)
-
-                SavedDrawingsStore.loadBitmap(file)?.let { thumb.setImageBitmap(it) }
-                name.text = file.nameWithoutExtension
-
-                view.setOnClickListener {
-                    showDrawingActionsDialog(
-                        file,
-                        // Edit takes you to the canvas to draw — the list shouldn't pop
-                        // back up afterward, so just close it.
-                        onEdited = { dialog.dismiss() },
-                        // Delete removes an item from this same list, so refresh it.
-                        onDeleted = {
-                            dialog.dismiss()
-                            showMyDrawingsDialog()
-                        }
-                    )
-                }
-                delete.setOnClickListener {
-                    SavedDrawingsStore.deleteProject(file)
-                    dialog.dismiss()
-                    showMyDrawingsDialog()
-                }
-                return view
-            }
-        }
-        listView.adapter = adapter
-
-        searchBox.addTextChangedListener(object : android.text.TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            override fun afterTextChanged(s: android.text.Editable?) {
-                val query = s.toString().trim().lowercase()
-                currentList.clear()
-                currentList.addAll(
-                    if (query.isEmpty()) allProjects
-                    else allProjects.filter { it.nameWithoutExtension.lowercase().contains(query) }
+            MotionEvent.ACTION_MOVE -> {
+                selectionRect = RectF(
+                    min(selectionStartX, x),
+                    min(selectionStartY, y),
+                    max(selectionStartX, x),
+                    max(selectionStartY, y)
                 )
-                adapter.notifyDataSetChanged()
+                invalidate()
             }
-        })
-
-        dialog.show()
-    }
-
-    /** Shown when a saved drawing is tapped: View, Edit, Share, or Delete it. */
-    private fun showDrawingActionsDialog(file: java.io.File, onEdited: () -> Unit, onDeleted: () -> Unit) {
-        val options = arrayOf("View", "Edit", "Share", "Delete")
-        AlertDialog.Builder(this)
-            .setTitle(file.nameWithoutExtension)
-            .setItems(options) { _, which ->
-                when (which) {
-                    0 -> showDrawingPreviewDialog(file)
-                    1 -> openForEditingWithOverwriteCheck(file, onEdited)
-                    2 -> {
-                        val uri = androidx.core.content.FileProvider.getUriForFile(
-                            this, "$packageName.fileprovider", file
-                        )
-                        SaveUtil.shareFile(this, uri, "image/png")
-                    }
-                    3 -> {
-                        AlertDialog.Builder(this)
-                            .setTitle("Delete this drawing?")
-                            .setMessage("\"${file.nameWithoutExtension}\" will be permanently deleted.")
-                            .setNegativeButton("Cancel", null)
-                            .setPositiveButton("Delete") { _, _ ->
-                                SavedDrawingsStore.deleteProject(file)
-                                onDeleted()
-                            }
-                            .show()
-                    }
+            MotionEvent.ACTION_UP -> {
+                val rect = selectionRect ?: return
+                if (rect.width() > 4f && rect.height() > 4f) {
+                    copiedSelection = cropSelection(rect)
+                    onSelectionReady?.invoke(rect)
+                    selectionRect = rect
+                } else {
+                    selectionRect = null
+                    copiedSelection = null
                 }
+                invalidate()
             }
-            .setNegativeButton("Cancel", null)
-            .show()
+        }
     }
 
-    /**
-     * Opening a saved drawing to edit it replaces whatever's currently on the canvas.
-     * If there's unsaved work there already, confirm before wiping it out.
-     */
-    private fun openForEditingWithOverwriteCheck(file: java.io.File, onEdited: () -> Unit) {
-        fun doLoad() {
-            SavedDrawingsStore.loadBitmap(file)?.let { bmp -> drawingView.loadAsCanvasBackground(bmp) }
-            onEdited()
+    private fun cropSelection(rect: RectF): Bitmap? {
+        val bmp = baseBitmap ?: return null
+        val left = rect.left.toInt().coerceIn(0, bmp.width - 1)
+        val top = rect.top.toInt().coerceIn(0, bmp.height - 1)
+        val right = rect.right.toInt().coerceIn(left + 1, bmp.width)
+        val bottom = rect.bottom.toInt().coerceIn(top + 1, bmp.height)
+        val w = (right - left).coerceAtLeast(1)
+        val h = (bottom - top).coerceAtLeast(1)
+        return Bitmap.createBitmap(bmp, left, top, w, h)
+    }
+
+    fun copySelection(): Bitmap? {
+        val rect = selectionRect ?: return null
+        val bmp = cropSelection(rect) ?: return null
+        copiedSelection = bmp
+        return bmp
+    }
+
+    fun pasteSelection(x: Float, y: Float) {
+        val bmp = copiedSelection ?: return
+        val canvas = baseCanvas ?: return
+        canvas.drawBitmap(bmp, x, y, Paint(Paint.ANTI_ALIAS_FLAG))
+        invalidate()
+    }
+
+    fun rotateSelectionClockwise() {
+        val bmp = copiedSelection ?: return
+        val matrix = Matrix().apply { postRotate(90f) }
+        copiedSelection = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+        invalidate()
+    }
+
+    fun deleteSelection() {
+        val rect = selectionRect ?: return
+        val canvas = baseCanvas ?: return
+        val paint = Paint().apply { xfermode = clearXfermode }
+        canvas.drawRect(rect, paint)
+        selectionRect = null
+        copiedSelection = null
+        invalidate()
+    }
+
+    private fun handleFreehand(event: MotionEvent, x: Float, y: Float) {
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                activePath = Path().apply { moveTo(x, y) }
+                configurePaintForTool()
+                updateCursor(x, y, visible = true)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                activePath?.lineTo(x, y)
+                updateCursor(x, y, visible = true)
+            }
+            MotionEvent.ACTION_UP -> {
+                activePath?.lineTo(x, y)
+                commitFreehandStroke()
+                updateCursor(x, y, visible = false)
+            }
         }
-        if (drawingView.canUndo()) {
-            AlertDialog.Builder(this)
-                .setTitle("Discard current drawing?")
-                .setMessage("Opening \"${file.nameWithoutExtension}\" will replace what's on the canvas right now. Anything unsaved will be lost.")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Discard & Open") { _, _ -> doLoad() }
-                .show()
+    }
+
+    private fun configurePaintForTool() {
+        activePaint.applyStrokeStyle()
+        activePaint.maskFilter = null
+        when (currentTool) {
+            Tool.PEN -> {
+                activePaint.color = currentColor
+                activePaint.alpha = 255
+                activePaint.strokeWidth = currentStrokeWidth
+            }
+            Tool.PENCIL -> {
+                activePaint.color = currentColor
+                activePaint.alpha = 200
+                activePaint.strokeWidth = max(2f, currentStrokeWidth * 0.5f)
+            }
+            Tool.MARKER -> {
+                activePaint.color = currentColor
+                activePaint.alpha = 255
+                activePaint.strokeWidth = currentStrokeWidth * 1.8f
+            }
+            Tool.HIGHLIGHTER -> {
+                activePaint.color = currentColor
+                activePaint.alpha = 140
+                activePaint.strokeWidth = currentStrokeWidth * 2.4f
+            }
+            Tool.BRUSH -> {
+                activePaint.color = currentColor
+                activePaint.alpha = 255
+                activePaint.strokeWidth = currentStrokeWidth * 1.3f
+                activePaint.maskFilter = android.graphics.BlurMaskFilter(
+                    currentStrokeWidth * 0.12f, android.graphics.BlurMaskFilter.Blur.SOLID
+                )
+            }
+            Tool.ERASER -> {
+                activePaint.color = ContextCompat.getColor(context, R.color.canvas_bg)
+                activePaint.alpha = 255
+                activePaint.strokeWidth = currentStrokeWidth * 1.5f
+            }
+            else -> {}
+        }
+    }
+
+    private fun commitFreehandStroke() {
+        val path = activePath ?: return
+        val isEraser = currentTool == Tool.ERASER
+        val blur = if (currentTool == Tool.BRUSH) currentStrokeWidth * 0.12f else 0f
+        val action = DrawAction.StrokeAction(
+            path = Path(path),
+            color = if (isEraser) Color.TRANSPARENT else activePaint.color,
+            strokeWidth = activePaint.strokeWidth,
+            alpha = activePaint.alpha,
+            isEraser = isEraser,
+            blurRadius = blur
+        )
+        drawStrokeToBase(action)
+        actions.add(action)
+        redoStack.clear()
+        activePath = null
+        onHistoryChanged?.invoke()
+    }
+
+    private fun drawStrokeToBase(action: DrawAction.StrokeAction) {
+        val canvas = baseCanvas ?: return
+        val paint = Paint().apply { applyStrokeStyle() }
+        paint.strokeWidth = action.strokeWidth
+        if (action.isEraser) {
+            paint.color = Color.TRANSPARENT
+            paint.xfermode = clearXfermode
         } else {
-            doLoad()
+            paint.color = action.color
+            paint.alpha = action.alpha
+            paint.xfermode = null
+            if (action.blurRadius > 0f) {
+                paint.maskFilter = android.graphics.BlurMaskFilter(action.blurRadius, android.graphics.BlurMaskFilter.Blur.SOLID)
+            }
+        }
+        canvas.drawPath(action.path, paint)
+    }
+
+    private fun handleShape(event: MotionEvent, x: Float, y: Float, type: ShapeType) {
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                shapeStartX = x; shapeStartY = y
+                shapeCurX = x; shapeCurY = y
+                isShaping = true
+                updateCursor(x, y, visible = true)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                shapeCurX = x; shapeCurY = y
+                updateCursor(x, y, visible = true)
+            }
+            MotionEvent.ACTION_UP -> {
+                shapeCurX = x; shapeCurY = y
+                isShaping = false
+                updateCursor(x, y, visible = false)
+                val bounds = RectF(
+                    min(shapeStartX, shapeCurX), min(shapeStartY, shapeCurY),
+                    max(shapeStartX, shapeCurX), max(shapeStartY, shapeCurY)
+                )
+                val action = DrawAction.ShapeAction(
+                    type = type,
+                    bounds = bounds,
+                    color = currentColor,
+                    strokeWidth = currentStrokeWidth,
+                    filled = shapesFilled
+                )
+                drawShapeToBase(action)
+                actions.add(action)
+                redoStack.clear()
+                onHistoryChanged?.invoke()
+                invalidate()
+            }
         }
     }
 
-    /** Full-size preview of a saved drawing. */
-    private fun showDrawingPreviewDialog(file: java.io.File) {
-        val bitmap = SavedDrawingsStore.loadBitmap(file) ?: return
-        val imageView = ImageView(this).apply {
-            setImageBitmap(bitmap)
-            adjustViewBounds = true
+    private fun buildShapePaint(color: Int, strokeWidth: Float, filled: Boolean): Paint {
+        return Paint().apply {
+            isAntiAlias = true
+            this.color = color
+            this.strokeWidth = strokeWidth
+            style = if (filled) Paint.Style.FILL else Paint.Style.STROKE
+            strokeJoin = Paint.Join.ROUND
+            strokeCap = Paint.Cap.ROUND
         }
-        AlertDialog.Builder(this)
-            .setTitle(file.nameWithoutExtension)
-            .setView(imageView)
-            .setPositiveButton("Close", null)
-            .show()
+    }
+
+    private fun drawShapeToBase(action: DrawAction.ShapeAction) {
+        val canvas = baseCanvas ?: return
+        drawShapeOn(canvas, action)
+    }
+
+    private fun drawShapeOn(canvas: Canvas, action: DrawAction.ShapeAction) {
+        val paint = buildShapePaint(action.color, action.strokeWidth, action.filled)
+        val b = action.bounds
+        when (action.type) {
+            ShapeType.LINE -> canvas.drawLine(shapeStartXFor(action), shapeStartYFor(action), b.right, b.bottom, paint)
+            ShapeType.RECTANGLE -> canvas.drawRect(b, paint)
+            ShapeType.CIRCLE -> canvas.drawOval(b, paint)
+            ShapeType.TRIANGLE -> {
+                val path = Path()
+                path.moveTo((b.left + b.right) / 2f, b.top)
+                path.lineTo(b.left, b.bottom)
+                path.lineTo(b.right, b.bottom)
+                path.close()
+                canvas.drawPath(path, paint)
+            }
+            ShapeType.STAR -> canvas.drawPath(buildStarPath(b), paint)
+        }
+    }
+
+    private fun shapeStartXFor(action: DrawAction.ShapeAction): Float = action.bounds.left
+    private fun shapeStartYFor(action: DrawAction.ShapeAction): Float = action.bounds.top
+
+    private fun buildStarPath(b: RectF): Path {
+        val cx = (b.left + b.right) / 2f
+        val cy = (b.top + b.bottom) / 2f
+        val outerR = min(b.width(), b.height()) / 2f
+        val innerR = outerR * 0.42f
+        val path = Path()
+        val points = 5
+        val startAngle = -Math.PI / 2
+        for (i in 0 until points * 2) {
+            val angle = startAngle + i * Math.PI / points
+            val r = if (i % 2 == 0) outerR else innerR
+            val px = (cx + r * cos(angle)).toFloat()
+            val py = (cy + r * sin(angle)).toFloat()
+            if (i == 0) path.moveTo(px, py) else path.lineTo(px, py)
+        }
+        path.close()
+        return path
+    }
+
+    fun addText(text: String, x: Float, y: Float, color: Int, textSize: Float, typeface: android.graphics.Typeface? = null) {
+        val action = DrawAction.TextAction(text, x, y, color, textSize, typeface)
+        drawTextToBase(action)
+        actions.add(action)
+        redoStack.clear()
+        onHistoryChanged?.invoke()
+        invalidate()
+    }
+
+    private fun drawTextToBase(action: DrawAction.TextAction) {
+        val canvas = baseCanvas ?: return
+        val paint = Paint().apply {
+            isAntiAlias = true
+            color = action.color
+            textSize = action.textSize
+            action.typeface?.let { typeface = it }
+        }
+        canvas.drawText(action.text, action.x, action.y, paint)
+    }
+
+    fun addImage(bitmap: Bitmap) {
+        val viewW = width.toFloat()
+        val viewH = height.toFloat()
+        if (viewW <= 0 || viewH <= 0) return
+        val maxW = viewW * 0.7f
+        val maxH = viewH * 0.7f
+        val scale = min(maxW / bitmap.width, maxH / bitmap.height).coerceAtMost(1f)
+        val w = bitmap.width * scale
+        val h = bitmap.height * scale
+        val left = (viewW - w) / 2f
+        val top = (viewH - h) / 2f
+        val bounds = RectF(left, top, left + w, top + h)
+        val action = DrawAction.ImageAction(bitmap, bounds)
+        drawImageToBase(action)
+        actions.add(action)
+        redoStack.clear()
+        onHistoryChanged?.invoke()
+        invalidate()
+    }
+
+    private fun drawImageToBase(action: DrawAction.ImageAction) {
+        val canvas = baseCanvas ?: return
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        canvas.drawBitmap(action.bitmap, null, action.bounds, paint)
+    }
+
+    fun loadAsCanvasBackground(bitmap: Bitmap) {
+        clearAll()
+        val viewW = width.toFloat()
+        val viewH = height.toFloat()
+        if (viewW <= 0 || viewH <= 0) return
+        val bounds = RectF(0f, 0f, viewW, viewH)
+        val action = DrawAction.ImageAction(bitmap, bounds)
+        drawImageToBase(action)
+        actions.add(action)
+        redoStack.clear()
+        onHistoryChanged?.invoke()
+        invalidate()
+    }
+
+    fun canUndo() = actions.isNotEmpty()
+    fun canRedo() = redoStack.isNotEmpty()
+
+    fun undo() {
+        if (actions.isEmpty()) return
+        val last = actions.removeAt(actions.size - 1)
+        redoStack.add(last)
+        redrawAllActions()
+        onHistoryChanged?.invoke()
+    }
+
+    fun redo() {
+        if (redoStack.isEmpty()) return
+        val action = redoStack.removeAt(redoStack.size - 1)
+        actions.add(action)
+        redrawAllActions()
+        onHistoryChanged?.invoke()
+    }
+
+    fun clearAll() {
+        actions.clear()
+        redoStack.clear()
+        redrawAllActions()
+        onHistoryChanged?.invoke()
+    }
+
+    private fun redrawAllActions() {
+        val canvas = baseCanvas ?: return
+        canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+        for (action in actions) {
+            when (action) {
+                is DrawAction.StrokeAction -> drawStrokeToBase(action)
+                is DrawAction.ShapeAction -> drawShapeOn(canvas, action)
+                is DrawAction.TextAction -> drawTextToBase(action)
+                is DrawAction.ImageAction -> drawImageToBase(action)
+            }
+        }
+        invalidate()
+    }
+
+    private fun floodFill(startX: Int, startY: Int, fillColor: Int) {
+        val bmp = baseBitmap ?: return
+        if (startX < 0 || startY < 0 || startX >= bmp.width || startY >= bmp.height) return
+
+        val targetColor = bmp.getPixel(startX, startY)
+        val replacement = fillColor or (0xFF shl 24)
+        if (targetColor == replacement) return
+
+        val pixels = IntArray(bmp.width * bmp.height)
+        bmp.getPixels(pixels, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+
+        val w = bmp.width
+        val h = bmp.height
+        val stack = ArrayDeque<Int>()
+        stack.addLast(startY * w + startX)
+        val tolerance = 30
+
+        fun colorsClose(a: Int, b: Int): Boolean {
+            val da = abs(((a shr 24) and 0xFF) - ((b shr 24) and 0xFF))
+            val dr = abs(((a shr 16) and 0xFF) - ((b shr 16) and 0xFF))
+            val dg = abs(((a shr 8) and 0xFF) - ((b shr 8) and 0xFF))
+            val db = abs((a and 0xFF) - (b and 0xFF))
+            return da + dr + dg + db < tolerance
+        }
+
+        var guard = 0
+        val maxIterations = w * h
+        while (stack.isNotEmpty() && guard < maxIterations) {
+            guard++
+            val idx = stack.removeLast()
+            if (idx < 0 || idx >= pixels.size) continue
+            if (!colorsClose(pixels[idx], targetColor)) continue
+            pixels[idx] = replacement
+
+            val px = idx % w
+            val py = idx / w
+            if (px > 0) stack.addLast(idx - 1)
+            if (px < w - 1) stack.addLast(idx + 1)
+            if (py > 0) stack.addLast(idx - w)
+            if (py < h - 1) stack.addLast(idx + w)
+        }
+
+        bmp.setPixels(pixels, 0, w, 0, 0, w, h)
+        actions.add(
+            DrawAction.ImageAction(
+                bitmap = Bitmap.createBitmap(bmp),
+                bounds = RectF(0f, 0f, w.toFloat(), h.toFloat())
+            )
+        )
+        redoStack.clear()
+        onHistoryChanged?.invoke()
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        canvas.save()
+        canvas.translate(panX, panY)
+        canvas.scale(scaleFactor, scaleFactor)
+
+        baseBitmap?.let { canvas.drawBitmap(it, 0f, 0f, null) }
+        activePath?.let { canvas.drawPath(it, activePaint) }
+
+        if (isShaping) {
+            val bounds = RectF(
+                min(shapeStartX, shapeCurX), min(shapeStartY, shapeCurY),
+                max(shapeStartX, shapeCurX), max(shapeStartY, shapeCurY)
+            )
+            val previewType = when (currentTool) {
+                Tool.LINE -> ShapeType.LINE
+                Tool.RECTANGLE -> ShapeType.RECTANGLE
+                Tool.CIRCLE -> ShapeType.CIRCLE
+                Tool.TRIANGLE -> ShapeType.TRIANGLE
+                Tool.STAR -> ShapeType.STAR
+                else -> null
+            }
+            previewType?.let { type ->
+                val previewAction = DrawAction.ShapeAction(
+                    type = type,
+                    bounds = bounds,
+                    color = currentColor,
+                    strokeWidth = currentStrokeWidth,
+                    filled = shapesFilled
+                )
+                drawShapeOn(canvas, previewAction)
+            }
+        }
+
+        selectionRect?.let { rect ->
+            val border = Paint().apply {
+                color = Color.argb(255, 66, 133, 244)
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+                isAntiAlias = true
+            }
+            canvas.drawRect(rect, border)
+        }
+
+        drawCursorOverlay(canvas)
+        canvas.restore()
+    }
+
+    fun exportBitmap(): Bitmap? {
+        val bmp = baseBitmap ?: return null
+        return Bitmap.createBitmap(bmp)
     }
 }
