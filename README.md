@@ -1,7 +1,7 @@
 # DrawingJoy — Private Drawing App for Android
 
 A simple, private, offline whiteboard-style drawing app. No login, no accounts,
-no ads, no tracking. Open → Draw → Save → Record → Share.
+no ads, no tracking. Open → Draw → Save → Share.
 
 ## What's inside
 
